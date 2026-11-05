@@ -17,9 +17,10 @@ and services (mapping/nav2/speech) are out of scope here.
 
 ### `robonix/primitive/chassis/posture` — set_posture
 
-Set the S10 to a named motion state by publishing `drdds/msg/MotionState` on
-`/MOTION_STATE`. Returns `{success, message}`. `success=false` means the target
-state was not observed within `posture_wait_s` seconds.
+Set the S10 to a named motion state (via `drdds/msg/MotionState` on
+`/MOTION_STATE`) or a named gait (via `drdds/msg/Gait` on `/GAIT`). Returns
+`{success, message}`. `success=false` means the target state/gait was not
+observed within `posture_wait_s` seconds.
 
 | posture_name | state | description |
 |--------------|-------|-------------|
@@ -28,9 +29,11 @@ state was not observed within `posture_wait_s` seconds.
 | `"rl"` (RL控制) | 17 | enter RL control directly; also sets the agile nav gait (0x3002) |
 | `"damping"` (关节阻尼/软急停) | 2 | joint damping / soft emergency stop |
 | `"zero"` (标零) | 5 | zero calibration |
+| `"stair"` (爬梯) | — | gait-only: publish `/GAIT` 0x3003 (楼梯·导航); stays in RL控制 (17) |
+| `"flat"` (平地) | — | gait-only: publish `/GAIT` 0x3002 (平地·导航); stays in RL控制 (17) |
 
 > **Before moving:** `/NAV_CMD` (used by `move`) is honoured only in **导航模式**,
-> which is three things together: RL控制 (17) + agile nav gait (0x3002) +
+> which is three things together: RL控制 (17) + nav gait (0x3002/0x3003) +
 > **使用模式 = 导航 (1)**. Under Robonix control the robot stays in 导航模式: the
 > primitive switches it on init and re-asserts it in `posture("stand")`/
 > `posture("rl")`. The 使用模式 is switched over the 本体监控协议 (plain UDP
@@ -70,10 +73,10 @@ dead-reckoned yaw. Returns JSON `{status, mode, duration_sec, …}` in `status`.
 > ⚠️ **Precondition:** the robot must be in 导航模式 — RL控制 (17) **and** the
 > agile nav gait (0x3002/0x3003) **and** 使用模式=导航(1). `posture("stand")`/
 > `posture("rl")` set all three; `/NAV_CMD` is ignored otherwise. `move`
-> re-checks state+gait from `/MOTION_INFO` **and** re-asserts the 使用模式 over
-> the 本体监控协议 before publishing `/NAV_CMD`; if either fails it returns
-> `{status:"error"}` asking the pilot to run `posture("stand")` or
-> `posture("rl")` first.
+> re-checks state+gait from `/MOTION_INFO`, then **reads** the 使用模式 from the
+> BasicStatus report over the 本体监控协议 and only re-switches it when it is not
+> already 导航(1); if either check fails it returns `{status:"error"}` asking the
+> pilot to run `posture("stand")` or `posture("rl")` first.
 
 ### `robonix/primitive/chassis/twist_in` — continuous velocity (topic)
 
@@ -87,7 +90,7 @@ A `nav_msgs/Odometry` stream (default `/odom`) forwarded from the
 S10's own `/ODOM` topic (a standard `nav_msgs/Odometry`, frame `map`). The S10
 fuses its own pose, so no dead-reckoning is done here. `frame_id` is re-stamped
 from the robot's LIO `map` frame to `odom_frame` (default `odom`) so consumers
-treat it as continuous `odom -> base_link` odometry rather than a second
+treat it as continuous `odom -> rbnx_base_link` odometry rather than a second
 `map` frame; `child_frame_id` is filled with `base_frame` because the S10
 leaves it empty. The pose is only meaningful once the robot is localised —
 while idle it reads garbage (huge x/y/z). The source is configurable via
@@ -112,14 +115,15 @@ alternatives that only publish while the LIO stack is running.
 | `odom_topic` | `/odom` | forwarded odometry output |
 | `odom_source_topic` | `/ODOM` | native S10 odometry topic to forward |
 | `odom_frame` | `odom` | `frame_id` stamped on the forwarded odometry |
-| `base_frame` | `base_link` | fills the S10's empty child_frame_id |
+| `base_frame` | `rbnx_base_link` | fills the S10's empty child_frame_id |
 | `sentinel_timeout_s` | `30.0` | wait for `/MOTION_INFO` on init |
 | `speed_mps` | `0.2` | forward/backward speed |
 | `ang_speed_rps` | `0.6` | rotation speed |
 | `default_duration_sec` | `1.0` | raw-velocity default duration |
 | `rotate_tolerance_deg` | `3.0` | closed-loop yaw tolerance |
 | `posture_wait_s` | `8.0` | wait for a posture transition |
-| `nav_gait` | `12290` | gait set on RL entry (0x3002 平地敏捷) |
+| `nav_gait` | `12290` | flat gait set on RL entry (0x3002 平地·导航) |
+| `stair_gait` | `12291` | stair gait for `posture("stair")` (0x3003 楼梯·导航) |
 | `usage_mode_ip` | `10.21.33.103` | 本体监控协议 host (使用模式切换) |
 | `usage_mode_port` | `30004` | plain UDP port (TCP alt `30003`; encryption disabled) |
 | `usage_mode_transport` | `udp` | `udp` or `tcp` for the usage-mode switch |

@@ -10,7 +10,7 @@ bridge:
 | `/MOTION_STATE` | `drdds/msg/MotionState` | out (stand/sit/RL) |
 | `/MOTION_INFO`  | `drdds/msg/MotionInfo`  | in (velocities + state @20 Hz) |
 | `/NAV_CMD`      | `drdds/msg/NavCmd`      | out (x/y/yaw velocity) |
-| `/GAIT`         | `drdds/msg/Gait`        | out (agile nav gait) |
+| `/GAIT`         | `drdds/msg/Gait`        | out (nav gait: flat 0x3002 / stair 0x3003) |
 | `/ODOM`         | `nav_msgs/Odometry`     | in (fused pose, re-stamped to `odom` frame) |
 
 Exposed Robonix capabilities: `chassis/driver`, `chassis/move`,

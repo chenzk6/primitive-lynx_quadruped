@@ -23,7 +23,7 @@ The S10 already publishes its fused pose on ``/ODOM`` (standard
 ``nav_msgs/Odometry``, frame ``map``); the primitive forwards it to the
 declared ``odom`` capability topic, re-stamping ``frame_id`` from the robot's
 LIO ``map`` frame to ``odom_frame`` (default ``odom``) so downstream treats it
-as continuous ``odom -> base_link`` odometry rather than a second ``map``
+as continuous ``odom -> rbnx_base_link`` odometry rather than a second ``map``
 frame. The pose is only meaningful once the robot is localised (it reads
 garbage while idle). ``/MOTION_INFO`` yaw rate is still
 integrated for the internal yaw used by ``rotate_deg``. ``/NAV_CMD`` is only
@@ -75,7 +75,7 @@ _motion_lock = threading.Lock()  # serialises move() bursts
 
 _motion_state: int | None = None  # latest drdds MotionState.state
 _motion_stamp = 0.0               # monotonic time of the last MotionInfo
-_gait: int | None = None          # latest drdds GaitValue.gait (0x1001 std / 0x3002 nav)
+_gait: int | None = None          # latest drdds GaitValue.gait (0x1001 std / 0x3002 flat / 0x3003 stair)
 
 _odom_yaw = 0.0                   # integrated yaw (from vel_yaw), for rotate_deg
 _last_info_t: float | None = None  # previous sample time, for dt
@@ -86,7 +86,7 @@ motion_state_pub = None
 gait_pub = None
 odom_pub = None
 
-base_frame = "base_link"
+base_frame = "rbnx_base_link"
 odom_frame = "odom"
 
 _speed_mps = 0.2
@@ -94,7 +94,8 @@ _ang_speed_rps = 0.6
 _default_dur = 1.0
 _rotate_tolerance_deg = 3.0
 _posture_wait_s = 8.0
-_nav_gait = 0x3002  # 平地敏捷步态, recommended for navigation
+_nav_gait = 0x3002   # 平地步态 (导航运动模式), recommended for navigation
+_stair_gait = 0x3003  # 楼梯步态 (导航运动模式), for stair climbing under /NAV_CMD
 
 # 本体监控协议 (使用模式切换): the S10's 使用模式 (常规0/导航1/辅助2) is not on
 # any ROS 2 topic; /NAV_CMD only works in 导航模式, so posture() switches it here.
@@ -125,6 +126,20 @@ STATE_NAMES = {
 }
 
 
+def _gait_for_posture(name: str) -> int | None:
+    """Resolve a gait-only posture name to its configured gait value.
+
+    These names switch /GAIT without touching the motion state — the robot
+    stays in RL控制(17). Both gaits are 导航运动模式 (0x3002 平地 / 0x3003 楼梯),
+    the two /NAV_CMD honours.
+    """
+    if name in ("flat", "平地"):
+        return _nav_gait
+    if name in ("stair", "爬梯", "楼梯"):
+        return _stair_gait
+    return None
+
+
 # ── ROS callbacks ───────────────────────────────────────────────────────────
 def _on_motion_info(msg) -> None:
     """Track robot state + gait, and integrate yaw rate for rotate_deg."""
@@ -147,7 +162,7 @@ def _on_native_odom(msg) -> None:
 
     The S10 already fuses its pose and publishes it on /ODOM stamped in its own
     LIO ``map`` frame. Downstream (the mapping service's map_to_odom_bridge)
-    needs this as the continuous ``odom -> base_link`` navigation odometry, so
+    needs this as the continuous ``odom -> rbnx_base_link`` navigation odometry, so
     we re-stamp the frame_id to ``odom_frame`` instead of passing the robot's
     ``map`` frame through. The pose is only meaningful once the robot is
     localised (it reads garbage while idle). The S10 leaves child_frame_id
@@ -208,14 +223,15 @@ def _wait_for_gait(target: int, timeout: float) -> bool:
     return _gait == target
 
 
-def _publish_nav_gait() -> None:
-    """Switch to the agile nav gait (0x3002 平地敏捷) — the navigation motion
-    mode that /NAV_CMD requires. Published a few times like /MOTION_STATE, and
-    only after the robot is already in RL控制(17)."""
-    if gait_pub is None or not _nav_gait:
+def _publish_nav_gait(gait: int | None = None) -> None:
+    """Switch to a 导航运动模式 gait (default _nav_gait 0x3002 平地, or 0x3003
+    楼梯). Published a few times like /MOTION_STATE, and only after the robot is
+    already in RL控制(17)."""
+    value = gait if gait is not None else _nav_gait
+    if gait_pub is None or not value:
         return
     g = Gait()
-    g.data.gait = _nav_gait
+    g.data.gait = value
     for _ in range(3):
         gait_pub.publish(g)
         time.sleep(0.2)
@@ -232,6 +248,9 @@ _MONITOR_TYPE_MODE_SWITCH = 0x00100002
 _MONITOR_CMD_MODE_SWITCH = 0x00500002
 _MONITOR_TYPE_HEARTBEAT = 0x00100064
 _MONITOR_CMD_HEARTBEAT = 0x00000005
+_MONITOR_TYPE_BASIC_STATUS = 0x00100064
+_MONITOR_CMD_BASIC_STATUS = 0x00f00000
+_USAGE_MODE_READ_S = 2.0             # wait for one 2Hz BasicStatus report
 
 
 def _monitor_frame(obj: dict, msg_id: int) -> bytes:
@@ -305,12 +324,68 @@ def _switch_usage_mode(mode: int) -> tuple[bool, str]:
                 pass
 
 
+def _read_usage_mode(timeout: float = _USAGE_MODE_READ_S) -> tuple[int | None, str]:
+    """Read the S10 使用模式 (0常规/1导航/2辅助) from its BasicStatus report.
+
+    The robot pushes BasicStatus (2Hz) to whoever sent a heartbeat, so we send
+    one heartbeat and read frames until a BasicStatus frame arrives. Returns
+    (mode, message); mode is None when nothing was read in time.
+    """
+    if not _usage_mode_ip:
+        return None, "usage-mode read disabled (no usage_mode_ip)"
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    hb = _monitor_frame({
+        "PatrolDevice": {"Type": _MONITOR_TYPE_HEARTBEAT, "Command": _MONITOR_CMD_HEARTBEAT,
+                         "Time": now, "Items": {}}}, 0)
+
+    sock = None
+    try:
+        if _usage_mode_transport == "tcp":
+            sock = socket.create_connection((_usage_mode_ip, _usage_mode_port), timeout=3.0)
+            sock.settimeout(1.0)
+            sock.sendall(hb)
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(1.0)
+            sock.sendto(hb, (_usage_mode_ip, _usage_mode_port))
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data = sock.recv(4096)
+            except (socket.timeout, OSError):
+                continue
+            if len(data) < 16 or data[:4] != _MONITOR_SYNC:
+                continue
+            try:
+                pd = json.loads(data[16:16 + struct.unpack("<H", data[4:6])[0]]
+                                .decode("utf-8")).get("PatrolDevice", {})
+            except Exception:
+                continue
+            if (pd.get("Type") != _MONITOR_TYPE_BASIC_STATUS
+                    or pd.get("Command") != _MONITOR_CMD_BASIC_STATUS):
+                continue
+            bs = (pd.get("Items") or {}).get("BasicStatus")
+            if isinstance(bs, dict) and "ControlUsageMode" in bs:
+                return int(bs["ControlUsageMode"]), f"usage mode={bs['ControlUsageMode']}"
+        return None, f"no BasicStatus from {_usage_mode_ip}:{_usage_mode_port}"
+    except OSError as e:
+        return None, f"usage-mode read failed: {e}"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 # ── posture control (MCP) ───────────────────────────────────────────────────
 @lynx_quadruped.mcp(
     "robonix/primitive/chassis/posture",
     description=(
-        'Switch the Lynx S10 motion state. posture_name: "stand"(站立, ends in '
-        'RL控制), "sit"(趴下), "rl"(RL控制), "damping"(软急停), "zero"(标零). '
+        'Switch the Lynx S10 motion state or gait. posture_name: "stand"(站立, '
+        'ends in RL控制), "sit"(趴下), "rl"(RL控制), "damping"(软急停), '
+        '"zero"(标零); gait-only: "stair"(爬梯, 0x3003), "flat"(平地, 0x3002). '
         'move only works after stand/rl.'
     ),
 )
@@ -327,17 +402,52 @@ def set_posture(req: SetPosture_Request) -> SetPosture_Response:
       "damping" (关节阻尼/软急停) -> 2
       "zero"   (标零)   -> 5
 
+    Gait-only names (no motion-state change; robot stays in RL控制 17):
+      "stair"  (爬梯)   -> /GAIT 0x3003 (楼梯, 导航运动模式)
+      "flat"   (平地)   -> /GAIT 0x3002 (平地, 导航运动模式)
+
     /NAV_CMD (used by move) only works in 导航模式: RL控制(17) + nav gait
-    0x3002 + 使用模式=导航(1). "stand"/"rl" end there — both switch the gait,
-    then the 使用模式 over the 本体监控协议."""
+    0x3002/0x3003 + 使用模式=导航(1). "stand"/"rl" end in the flat gait and
+    switch the 使用模式 over the 本体监控协议."""
     raw = (req.posture_name or "").strip()
-    state = POSTURE_STATES.get(raw) or POSTURE_STATES.get(raw.lower())
+    key = raw.lower()
+
+    gait = _gait_for_posture(key)
+    if gait is not None:
+        # Gait-only switch: changes /GAIT, not the motion state. The robot must
+        # already be in RL控制(17); the 使用模式 stays 导航(1) (Robonix keeps it
+        # there the whole time), so no UDP round-trip is needed here.
+        if _motion_state != 17:
+            return SetPosture_Response(
+                success=False,
+                message=(
+                    f"cannot switch gait to {raw!r}: robot not in RL控制(17) "
+                    f"(state={_motion_state} {STATE_NAMES.get(_motion_state, '')}); "
+                    "call posture('stand') or posture('rl') first"
+                ),
+            )
+        _publish_nav_gait(gait)
+        if not _wait_for_gait(gait, _posture_wait_s):
+            return SetPosture_Response(
+                success=False,
+                message=(
+                    f"sent gait {hex(gait)} ({raw}); not confirmed within "
+                    f"{_posture_wait_s}s (gait={hex(_gait) if _gait else 'unknown'})"
+                ),
+            )
+        return SetPosture_Response(
+            success=True,
+            message=f"{raw} ok (gait={hex(_gait)})",
+        )
+
+    state = POSTURE_STATES.get(raw) or POSTURE_STATES.get(key)
     if state is None:
         return SetPosture_Response(
             success=False,
             message=(
                 f"unknown posture {req.posture_name!r}; valid: "
-                "stand(站立), sit(趴下), rl(RL控制), damping(软急停), zero(标零)"
+                "stand(站立), sit(趴下), rl(RL控制), damping(软急停), zero(标零), "
+                "stair(爬梯), flat(平地)"
             ),
         )
 
@@ -508,8 +618,8 @@ def move(req: ExecuteMoveCommand_Request) -> ExecuteMoveCommand_Response:
 
     Precondition: the robot must be in RL nav mode — state 17 plus the agile
     nav gait (0x3002/0x3003) plus 使用模式=导航(1). posture('stand')/posture('rl')
-    set all three; move re-asserts the 使用模式 over the 本体监控协议 and refuses
-    to publish /NAV_CMD if that switch fails.
+    set all three; move reads the 使用模式 over the 本体监控协议 and only re-switches
+    it when it is not already 导航(1), refusing to publish /NAV_CMD if that fails.
     """
     if nav_cmd_pub is None:
         return _move_response({"status": "error", "error": "ROS2 not initialized"})
@@ -517,8 +627,8 @@ def move(req: ExecuteMoveCommand_Request) -> ExecuteMoveCommand_Response:
     # /NAV_CMD only takes effect in navigation mode, which is three things
     # together: state 17 + agile nav gait (0x3002) + 使用模式=导航(1). The first
     # two come from /MOTION_INFO; the 使用模式 is not on any ROS 2 topic, so it is
-    # re-asserted over the 本体监控协议 (idempotent) before every move.
-    if _motion_state != 17 or (_gait != _nav_gait):
+    # read over the 本体监控协议 and only switched when it is not already 导航(1).
+    if _motion_state != 17 or (_gait not in (_nav_gait, _stair_gait)):
         return _move_response({
             "status": "error",
             "error": (
@@ -527,15 +637,17 @@ def move(req: ExecuteMoveCommand_Request) -> ExecuteMoveCommand_Response:
                 "call posture('stand') or posture('rl') first"
             ),
         })
-    ok, mode_msg = _switch_usage_mode(_nav_usage_mode)
-    if not ok:
-        return _move_response({
-            "status": "error",
-            "error": (
-                f"not in navigation mode (usage-mode switch failed: {mode_msg}); "
-                "call posture('stand') or posture('rl') first"
-            ),
-        })
+    mode, _ = _read_usage_mode()
+    if mode != _nav_usage_mode:
+        ok, mode_msg = _switch_usage_mode(_nav_usage_mode)
+        if not ok:
+            return _move_response({
+                "status": "error",
+                "error": (
+                    f"not in navigation mode (usage-mode switch failed: {mode_msg}); "
+                    "call posture('stand') or posture('rl') first"
+                ),
+            })
 
     msg = req.command
     with _motion_lock:
@@ -589,7 +701,7 @@ def init(cfg):
     """INACTIVE: open the drdds publishers/subscriptions, await the S10 stream."""
     global nav_cmd_pub, motion_state_pub, gait_pub, odom_pub
     global base_frame, odom_frame
-    global _speed_mps, _ang_speed_rps, _default_dur, _rotate_tolerance_deg, _posture_wait_s, _nav_gait
+    global _speed_mps, _ang_speed_rps, _default_dur, _rotate_tolerance_deg, _posture_wait_s, _nav_gait, _stair_gait
     global _usage_mode_ip, _usage_mode_port, _usage_mode_transport, _nav_usage_mode
 
     motion_state_topic = cfg.get("motion_state_topic", "/MOTION_STATE")
@@ -601,7 +713,7 @@ def init(cfg):
     odom_source_topic = cfg.get("odom_source_topic", "/ODOM")
     sentinel_timeout = float(cfg.get("sentinel_timeout_s", 30.0))
 
-    base_frame = str(cfg.get("base_frame", "base_link"))
+    base_frame = str(cfg.get("base_frame", "rbnx_base_link"))
     odom_frame = str(cfg.get("odom_frame", "odom"))
     _speed_mps = float(cfg.get("speed_mps", os.environ.get("LYNX_SPEED_MPS", "0.2")))
     _ang_speed_rps = float(cfg.get("ang_speed_rps", os.environ.get("LYNX_ANG_SPEED_RPS", "0.6")))
@@ -609,6 +721,7 @@ def init(cfg):
     _rotate_tolerance_deg = float(cfg.get("rotate_tolerance_deg", os.environ.get("LYNX_ROTATE_TOLERANCE_DEG", "3.0")))
     _posture_wait_s = float(cfg.get("posture_wait_s", 8.0))
     _nav_gait = int(cfg.get("nav_gait", 0x3002))
+    _stair_gait = int(cfg.get("stair_gait", 0x3003))
 
     # 本体监控协议 (使用模式切换) — plain UDP 30004 / TCP 30003 (encryption off).
     _usage_mode_ip = str(cfg.get("usage_mode_ip", os.environ.get("LYNX_USAGE_MODE_IP", "10.21.33.103")))
